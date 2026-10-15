@@ -2,6 +2,8 @@ package realm
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"testing"
 
@@ -83,7 +85,7 @@ func TestPunchPacketRejectsBadLengths(t *testing.T) {
 
 func TestPunchPacketRejectsUnknownType(t *testing.T) {
 	meta := testPunchMetadata()
-	_, obfsKey, err := decodePunchMetadata(meta)
+	key, err := newPunchKey(meta)
 	require.NoError(t, err)
 
 	packet := make([]byte, punchMinWireLen)
@@ -91,10 +93,8 @@ func TestPunchPacketRejectsUnknownType(t *testing.T) {
 	plain := packet[punchSaltLen:]
 	copy(plain[:len(punchMagic)], punchMagic[:])
 	plain[len(punchMagic)] = 0xff
-	nonce, _, err := decodePunchMetadata(meta)
-	require.NoError(t, err)
-	copy(plain[len(punchMagic)+1:punchHeaderLen], nonce)
-	xorPunchPacket(plain, obfsKey, packet[:punchSaltLen])
+	copy(plain[len(punchMagic)+1:punchHeaderLen], key.nonce[:])
+	xorPunchPacket(plain, &key.obfs, packet[:punchSaltLen])
 
 	_, err = DecodePunchPacket(packet, meta)
 	require.Error(t, err)
@@ -130,6 +130,42 @@ func TestPunchPacketPaddingVaries(t *testing.T) {
 		seen[decoded.PaddingLength] = struct{}{}
 	}
 	assert.Greater(t, len(seen), 1)
+}
+
+// TestPunchPacketWireFormatUnchanged checks packets against an independent
+// implementation of the original format, so peers running older versions
+// keep understanding each other.
+func TestPunchPacketWireFormatUnchanged(t *testing.T) {
+	meta := testPunchMetadata()
+	nonce, _ := hex.DecodeString(meta.Nonce)
+	obfsKey, _ := hex.DecodeString(meta.Obfs)
+	legacyXOR := func(data, salt []byte) {
+		h := sha256.New()
+		h.Write(obfsKey)
+		h.Write(salt)
+		mask := h.Sum(nil)
+		for i := range data {
+			data[i] ^= mask[i%len(mask)]
+		}
+	}
+
+	packet, err := EncodePunchPacket(PunchPacketAck, meta)
+	require.NoError(t, err)
+	plain := append([]byte(nil), packet[punchSaltLen:]...)
+	legacyXOR(plain, packet[:punchSaltLen])
+	assert.Equal(t, punchMagic[:], plain[:8])
+	assert.Equal(t, byte(PunchPacketAck), plain[8])
+	assert.Equal(t, nonce, plain[9:25])
+
+	legacy := make([]byte, punchMinWireLen+40)
+	copy(legacy, "saltsalt")
+	copy(legacy[punchSaltLen:], punchMagic[:])
+	legacy[punchSaltLen+8] = byte(PunchPacketHello)
+	copy(legacy[punchSaltLen+9:], nonce)
+	legacyXOR(legacy[punchSaltLen:], legacy[:punchSaltLen])
+	decoded, err := DecodePunchPacket(legacy, meta)
+	require.NoError(t, err)
+	assert.Equal(t, PunchPacket{Type: PunchPacketHello, PaddingLength: 40}, decoded)
 }
 
 func testPunchMetadata() PunchMetadata {

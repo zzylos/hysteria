@@ -25,6 +25,14 @@ var (
 	ErrInvalidPunchPacket = errors.New("invalid punch packet")
 
 	punchMagic = [8]byte{'H', 'Y', 'R', 'L', 'M', 'v', '1', 0}
+
+	// Created once so that rejecting a packet doesn't allocate. Most
+	// packets checked are not punch packets.
+	errPunchTooShort = fmt.Errorf("%w: packet too short", ErrInvalidPunchPacket)
+	errPunchTooLong  = fmt.Errorf("%w: packet too long", ErrInvalidPunchPacket)
+	errPunchBadMagic = fmt.Errorf("%w: bad magic", ErrInvalidPunchPacket)
+	errPunchBadType  = fmt.Errorf("%w: unknown packet type", ErrInvalidPunchPacket)
+	errPunchBadNonce = fmt.Errorf("%w: nonce mismatch", ErrInvalidPunchPacket)
 )
 
 type PunchPacketType byte
@@ -39,64 +47,107 @@ type PunchPacket struct {
 	PaddingLength int
 }
 
-func EncodePunchPacket(packetType PunchPacketType, meta PunchMetadata) ([]byte, error) {
-	if !validPunchPacketType(packetType) {
-		return nil, fmt.Errorf("%w: unknown packet type", ErrInvalidPunchPacket)
-	}
+// punchKey is PunchMetadata decoded from hex, so the hot paths don't
+// decode it for every packet.
+type punchKey struct {
+	nonce [PunchNonceSize]byte
+	obfs  [PunchObfsKeySize]byte
+}
+
+func newPunchKey(meta PunchMetadata) (punchKey, error) {
 	nonce, obfsKey, err := decodePunchMetadata(meta)
 	if err != nil {
+		return punchKey{}, err
+	}
+	var k punchKey
+	copy(k.nonce[:], nonce)
+	copy(k.obfs[:], obfsKey)
+	return k, nil
+}
+
+func EncodePunchPacket(packetType PunchPacketType, meta PunchMetadata) ([]byte, error) {
+	if !validPunchPacketType(packetType) {
+		return nil, errPunchBadType
+	}
+	key, err := newPunchKey(meta)
+	if err != nil {
 		return nil, err
+	}
+	return key.encode(packetType)
+}
+
+func (k *punchKey) encode(packetType PunchPacketType) ([]byte, error) {
+	if !validPunchPacketType(packetType) {
+		return nil, errPunchBadType
 	}
 	paddingLength, err := randomPaddingLength()
 	if err != nil {
 		return nil, err
 	}
-	plain := make([]byte, punchHeaderLen+paddingLength)
+	packet := make([]byte, punchMinWireLen+paddingLength)
+	if _, err := rand.Read(packet[:punchSaltLen]); err != nil {
+		return nil, err
+	}
+	plain := packet[punchSaltLen:]
 	copy(plain[:len(punchMagic)], punchMagic[:])
 	plain[len(punchMagic)] = byte(packetType)
-	copy(plain[len(punchMagic)+1:punchHeaderLen], nonce)
+	copy(plain[len(punchMagic)+1:punchHeaderLen], k.nonce[:])
 	if paddingLength > 0 {
 		if _, err := rand.Read(plain[punchHeaderLen:]); err != nil {
 			return nil, err
 		}
 	}
-	packet := make([]byte, punchSaltLen+len(plain))
-	if _, err := rand.Read(packet[:punchSaltLen]); err != nil {
-		return nil, err
-	}
-	copy(packet[punchSaltLen:], plain)
-	xorPunchPacket(packet[punchSaltLen:], obfsKey, packet[:punchSaltLen])
+	xorPunchPacket(plain, &k.obfs, packet[:punchSaltLen])
 	return packet, nil
 }
 
 func DecodePunchPacket(packet []byte, meta PunchMetadata) (PunchPacket, error) {
-	if len(packet) < punchMinWireLen {
-		return PunchPacket{}, fmt.Errorf("%w: packet too short", ErrInvalidPunchPacket)
+	if err := checkPunchPacketLen(packet); err != nil {
+		return PunchPacket{}, err
 	}
-	if len(packet) > punchMaxWireLen {
-		return PunchPacket{}, fmt.Errorf("%w: packet too long", ErrInvalidPunchPacket)
-	}
-	nonce, obfsKey, err := decodePunchMetadata(meta)
+	key, err := newPunchKey(meta)
 	if err != nil {
 		return PunchPacket{}, err
 	}
-	salt := packet[:punchSaltLen]
-	plain := append([]byte(nil), packet[punchSaltLen:]...)
-	xorPunchPacket(plain, obfsKey, salt)
-	if !bytes.Equal(plain[:len(punchMagic)], punchMagic[:]) {
-		return PunchPacket{}, fmt.Errorf("%w: bad magic", ErrInvalidPunchPacket)
+	return key.decode(packet)
+}
+
+// decode checks whether packet is a punch packet for this key. Only the
+// fixed-size header is unmasked, into a stack buffer, so checking a packet
+// that isn't one costs a single SHA-256 and no allocations.
+func (k *punchKey) decode(packet []byte) (PunchPacket, error) {
+	if err := checkPunchPacketLen(packet); err != nil {
+		return PunchPacket{}, err
 	}
-	packetType := PunchPacketType(plain[len(punchMagic)])
+	mask := punchMask(&k.obfs, packet[:punchSaltLen])
+	var header [punchHeaderLen]byte
+	for i := range header {
+		header[i] = packet[punchSaltLen+i] ^ mask[i%len(mask)]
+	}
+	if !bytes.Equal(header[:len(punchMagic)], punchMagic[:]) {
+		return PunchPacket{}, errPunchBadMagic
+	}
+	packetType := PunchPacketType(header[len(punchMagic)])
 	if !validPunchPacketType(packetType) {
-		return PunchPacket{}, fmt.Errorf("%w: unknown packet type", ErrInvalidPunchPacket)
+		return PunchPacket{}, errPunchBadType
 	}
-	if !bytes.Equal(plain[len(punchMagic)+1:punchHeaderLen], nonce) {
-		return PunchPacket{}, fmt.Errorf("%w: nonce mismatch", ErrInvalidPunchPacket)
+	if !bytes.Equal(header[len(punchMagic)+1:], k.nonce[:]) {
+		return PunchPacket{}, errPunchBadNonce
 	}
 	return PunchPacket{
 		Type:          packetType,
-		PaddingLength: len(plain) - punchHeaderLen,
+		PaddingLength: len(packet) - punchMinWireLen,
 	}, nil
+}
+
+func checkPunchPacketLen(packet []byte) error {
+	if len(packet) < punchMinWireLen {
+		return errPunchTooShort
+	}
+	if len(packet) > punchMaxWireLen {
+		return errPunchTooLong
+	}
+	return nil
 }
 
 func decodePunchMetadata(meta PunchMetadata) (nonce, obfsKey []byte, err error) {
@@ -130,11 +181,16 @@ func randomPaddingLength() (int, error) {
 	return int(n.Int64()), nil
 }
 
-func xorPunchPacket(packet, obfsKey, salt []byte) {
-	h := sha256.New()
-	_, _ = h.Write(obfsKey)
-	_, _ = h.Write(salt)
-	mask := h.Sum(nil)
+// punchMask returns SHA-256(obfsKey || salt), the XOR mask for a packet.
+func punchMask(obfsKey *[PunchObfsKeySize]byte, salt []byte) [sha256.Size]byte {
+	var buf [PunchObfsKeySize + punchSaltLen]byte
+	copy(buf[:], obfsKey[:])
+	copy(buf[PunchObfsKeySize:], salt)
+	return sha256.Sum256(buf[:])
+}
+
+func xorPunchPacket(packet []byte, obfsKey *[PunchObfsKeySize]byte, salt []byte) {
+	mask := punchMask(obfsKey, salt)
 	for i := range packet {
 		packet[i] ^= mask[i%len(mask)]
 	}

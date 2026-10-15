@@ -49,16 +49,18 @@ func TestDiscoverSTUNDeduplicatesResponses(t *testing.T) {
 }
 
 func TestDiscoverSTUNIPv6(t *testing.T) {
-	server := newFakeSTUNServer(t, "udp6", "[::1]:0", []netip.AddrPort{
-		netip.MustParseAddrPort("[2001:db8::10]:4433"),
-	})
-	defer server.Close()
-
+	// Check for IPv6 before starting the fake server, which can't listen
+	// without it either.
 	conn, err := net.ListenPacket("udp6", "[::1]:0")
 	if err != nil {
 		t.Skipf("IPv6 loopback unavailable: %v", err)
 	}
 	defer conn.Close()
+
+	server := newFakeSTUNServer(t, "udp6", "[::1]:0", []netip.AddrPort{
+		netip.MustParseAddrPort("[2001:db8::10]:4433"),
+	})
+	defer server.Close()
 
 	addrs, err := Discover(context.Background(), conn, STUNConfig{
 		Servers: []string{server.Addr().String()},
@@ -87,6 +89,97 @@ func TestDiscoverSTUNWithDemux(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, []netip.AddrPort{netip.MustParseAddrPort("203.0.113.10:4433")}, addrs)
+}
+
+func TestDiscoverDoesNotWaitForUnresponsiveServer(t *testing.T) {
+	good := newFakeSTUNServer(t, "udp4", "127.0.0.1:0", []netip.AddrPort{
+		netip.MustParseAddrPort("203.0.113.10:4433"),
+	})
+	defer good.Close()
+	silent := listenUDP4(t)
+	defer silent.Close()
+	servers := []string{good.Addr().String(), silent.LocalAddr().String()}
+
+	t.Run("direct", func(t *testing.T) {
+		conn := listenUDP4(t)
+		defer conn.Close()
+		start := time.Now()
+		addrs, err := Discover(context.Background(), conn, STUNConfig{Servers: servers, Timeout: 5 * time.Second})
+		require.NoError(t, err)
+		assert.Equal(t, []netip.AddrPort{netip.MustParseAddrPort("203.0.113.10:4433")}, addrs)
+		assert.Less(t, time.Since(start), 2*time.Second)
+	})
+	t.Run("demux", func(t *testing.T) {
+		conn := listenUDP4(t)
+		defer conn.Close()
+		wrapped, err := NewPunchPacketConn(conn, 4)
+		require.NoError(t, err)
+		go pumpPunchPacketConn(wrapped)
+		start := time.Now()
+		addrs, err := DiscoverWithDemux(context.Background(), wrapped, STUNConfig{Servers: servers, Timeout: 5 * time.Second})
+		require.NoError(t, err)
+		assert.Equal(t, []netip.AddrPort{netip.MustParseAddrPort("203.0.113.10:4433")}, addrs)
+		assert.Less(t, time.Since(start), 2*time.Second)
+	})
+}
+
+func TestDiscoverSkipsServersThatFailToResolve(t *testing.T) {
+	good := newFakeSTUNServer(t, "udp4", "127.0.0.1:0", []netip.AddrPort{
+		netip.MustParseAddrPort("203.0.113.10:4433"),
+	})
+	defer good.Close()
+	_, port, err := net.SplitHostPort(good.Addr().String())
+	require.NoError(t, err)
+	conn := listenUDP4(t)
+	defer conn.Close()
+
+	addrs, err := Discover(context.Background(), conn, STUNConfig{
+		Servers:  []string{"broken.example:" + port, "good.example:" + port},
+		Timeout:  2 * time.Second,
+		Resolver: fakeSTUNResolver{"good.example": {{IP: net.ParseIP("127.0.0.1")}}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []netip.AddrPort{netip.MustParseAddrPort("203.0.113.10:4433")}, addrs)
+}
+
+func TestResolveSTUNServersFailsWhenNothingResolves(t *testing.T) {
+	_, err := resolveSTUNServers(context.Background(), fakeSTUNResolver{}, []string{"a.example", "b.example"}, AddrFamilyAny)
+	require.Error(t, err)
+}
+
+// Discoveries on one conn used to read a shared channel and throw away
+// responses that weren't theirs, so one could starve the other.
+func TestDiscoverWithDemuxConcurrentCallsGetTheirOwnResponses(t *testing.T) {
+	serverA := newFakeSTUNServer(t, "udp4", "127.0.0.1:0", []netip.AddrPort{netip.MustParseAddrPort("203.0.113.1:1111")})
+	defer serverA.Close()
+	serverB := newFakeSTUNServer(t, "udp4", "127.0.0.1:0", []netip.AddrPort{netip.MustParseAddrPort("203.0.113.2:2222")})
+	defer serverB.Close()
+	conn := listenUDP4(t)
+	defer conn.Close()
+	wrapped, err := NewPunchPacketConn(conn, 4)
+	require.NoError(t, err)
+	go pumpPunchPacketConn(wrapped)
+
+	for range 10 {
+		type result struct {
+			addrs []netip.AddrPort
+			err   error
+		}
+		discover := func(server string) <-chan result {
+			ch := make(chan result, 1)
+			go func() {
+				addrs, err := DiscoverWithDemux(context.Background(), wrapped, STUNConfig{Servers: []string{server}, Timeout: 2 * time.Second})
+				ch <- result{addrs, err}
+			}()
+			return ch
+		}
+		a, b := discover(serverA.Addr().String()), discover(serverB.Addr().String())
+		ra, rb := <-a, <-b
+		require.NoError(t, ra.err)
+		require.NoError(t, rb.err)
+		assert.Equal(t, []netip.AddrPort{netip.MustParseAddrPort("203.0.113.1:1111")}, ra.addrs)
+		assert.Equal(t, []netip.AddrPort{netip.MustParseAddrPort("203.0.113.2:2222")}, rb.addrs)
+	}
 }
 
 func TestResolveSTUNServersUsesAllResolvedAddresses(t *testing.T) {

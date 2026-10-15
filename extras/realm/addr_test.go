@@ -108,6 +108,7 @@ func TestParseAddrInvalid(t *testing.T) {
 		{name: "escaped slash in realm", raw: "realm://secret@example.com/realm%2Fextra", err: ErrInvalidAddr},
 		{name: "invalid port", raw: "realm://secret@example.com:70000/realm", err: ErrInvalidAddr},
 		{name: "fragment", raw: "realm://secret@example.com/realm#frag", err: ErrInvalidAddr},
+		{name: "empty query marker", raw: "realm://secret@example.com/realm?", err: ErrInvalidAddr},
 		{name: "lport not a number", raw: "realm://secret@example.com/realm?lport=abc", err: ErrInvalidAddr},
 		{name: "lport zero", raw: "realm://secret@example.com/realm?lport=0", err: ErrInvalidAddr},
 		{name: "lport too high", raw: "realm://secret@example.com/realm?lport=65536", err: ErrInvalidAddr},
