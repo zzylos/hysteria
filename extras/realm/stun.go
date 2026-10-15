@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pion/stun/v3"
@@ -17,6 +18,11 @@ import (
 const (
 	defaultSTUNPort    = "3478"
 	defaultSTUNTimeout = 4 * time.Second
+	// stunResponseGrace is how long discovery keeps waiting for the other
+	// servers after the first response. Answers from several servers are
+	// how symmetric NATs are detected, but one server that never answers
+	// shouldn't stretch every discovery to the full timeout.
+	stunResponseGrace = 500 * time.Millisecond
 )
 
 var ErrInvalidSTUNConfig = errors.New("invalid STUN config")
@@ -60,7 +66,7 @@ func Discover(ctx context.Context, conn net.PacketConn, config STUNConfig) ([]ne
 	if err != nil {
 		return nil, err
 	}
-	transactions, err := sendSTUNRequests(conn, stunAddrs)
+	transactions, err := sendSTUNRequests(conn, stunAddrs, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -68,11 +74,10 @@ func Discover(ctx context.Context, conn net.PacketConn, config STUNConfig) ([]ne
 	defer conn.SetReadDeadline(time.Time{})
 	results := make(map[netip.AddrPort]struct{})
 	buf := make([]byte, 1500)
+	deadline, _ := ctx.Deadline()
+	graceStarted := false
 	for len(transactions) > 0 {
-		deadline, ok := ctx.Deadline()
-		if ok {
-			_ = conn.SetReadDeadline(deadline)
-		}
+		_ = conn.SetReadDeadline(deadline)
 		n, _, err := conn.ReadFrom(buf)
 		if err != nil {
 			if ctx.Err() != nil || isTimeout(err) {
@@ -89,6 +94,12 @@ func Discover(ctx context.Context, conn net.PacketConn, config STUNConfig) ([]ne
 		}
 		delete(transactions, msg.TransactionID)
 		results[addr] = struct{}{}
+		if !graceStarted {
+			graceStarted = true
+			if grace := time.Now().Add(stunResponseGrace); grace.Before(deadline) {
+				deadline = grace
+			}
+		}
 	}
 	return finishSTUNResults(results, ctx.Err())
 }
@@ -119,57 +130,99 @@ func DiscoverWithDemux(ctx context.Context, conn *PunchPacketConn, config STUNCo
 	if err != nil {
 		return nil, err
 	}
-	transactions, err := sendSTUNRequests(conn, stunAddrs)
+	// Claim the responses to our own transactions before sending, so a
+	// concurrent discovery on the same conn can't consume them.
+	responses := make(chan STUNPacketEvent, len(stunAddrs))
+	var ids [][stun.TransactionIDSize]byte
+	defer func() { conn.forgetSTUN(ids) }()
+	transactions, err := sendSTUNRequests(conn, stunAddrs, func(id [stun.TransactionIDSize]byte) {
+		conn.expectSTUN(id, responses)
+		ids = append(ids, id)
+	})
 	if err != nil {
 		return nil, err
 	}
 
 	results := make(map[netip.AddrPort]struct{})
+	var grace <-chan time.Time
 	for len(transactions) > 0 {
 		select {
 		case <-ctx.Done():
 			return finishSTUNResults(results, ctx.Err())
-		case ev := <-conn.STUNEvents():
+		case <-grace:
+			return finishSTUNResults(results, nil)
+		case ev := <-responses:
 			if _, ok := transactions[ev.Message.TransactionID]; !ok {
 				continue
 			}
 			delete(transactions, ev.Message.TransactionID)
 			results[ev.Addr] = struct{}{}
+			if grace == nil {
+				t := time.NewTimer(stunResponseGrace)
+				defer t.Stop()
+				grace = t.C
+			}
 		}
 	}
 	return finishSTUNResults(results, nil)
 }
 
 func resolveSTUNServers(ctx context.Context, resolver STUNResolver, servers []string, family AddrFamily) ([]*net.UDPAddr, error) {
-	var out []*net.UDPAddr
-	seen := make(map[string]struct{})
+	type target struct{ host, port string }
+	targets := make([]target, 0, len(servers))
 	for _, server := range servers {
 		host, port, err := splitSTUNServer(server)
 		if err != nil {
 			return nil, err
 		}
-		ips, err := resolver.LookupIPAddr(ctx, host)
-		if err != nil {
-			return nil, err
+		targets = append(targets, target{host: host, port: port})
+	}
+
+	// Resolve in parallel and skip names that fail: one broken or slow
+	// name shouldn't fail discovery or use up its timeout while the other
+	// servers work.
+	lookups := make([][]net.IPAddr, len(targets))
+	lookupErrs := make([]error, len(targets))
+	var wg sync.WaitGroup
+	for i, t := range targets {
+		wg.Go(func() {
+			lookups[i], lookupErrs[i] = resolver.LookupIPAddr(ctx, t.host)
+		})
+	}
+	wg.Wait()
+
+	var out []*net.UDPAddr
+	seen := make(map[string]struct{})
+	for i, t := range targets {
+		if lookupErrs[i] != nil {
+			continue
 		}
-		for _, ipAddr := range ips {
+		for _, ipAddr := range lookups[i] {
 			ip := ipAddr.IP
 			if ip == nil || !family.allows(ip) {
 				continue
 			}
-			key := net.JoinHostPort(ip.String(), port)
+			key := net.JoinHostPort(ip.String(), t.port)
 			if _, ok := seen[key]; ok {
 				continue
 			}
 			seen[key] = struct{}{}
-			portNum, _ := strconv.Atoi(port)
+			portNum, _ := strconv.Atoi(t.port)
 			out = append(out, &net.UDPAddr{IP: ip, Port: portNum})
+		}
+	}
+	if len(out) == 0 {
+		if err := errors.Join(lookupErrs...); err != nil {
+			return nil, err
 		}
 	}
 	return out, nil
 }
 
-func sendSTUNRequests(conn net.PacketConn, addrs []*net.UDPAddr) (map[[stun.TransactionIDSize]byte]*net.UDPAddr, error) {
+// sendSTUNRequests sends a binding request to each address. If register is
+// not nil, it is called with each transaction ID before that request is
+// sent.
+func sendSTUNRequests(conn net.PacketConn, addrs []*net.UDPAddr, register func([stun.TransactionIDSize]byte)) (map[[stun.TransactionIDSize]byte]*net.UDPAddr, error) {
 	if len(addrs) == 0 {
 		return nil, fmt.Errorf("%w: no STUN server addresses match the local socket family", ErrInvalidSTUNConfig)
 	}
@@ -178,6 +231,9 @@ func sendSTUNRequests(conn net.PacketConn, addrs []*net.UDPAddr) (map[[stun.Tran
 		msg, err := stun.Build(stun.TransactionID, stun.BindingRequest)
 		if err != nil {
 			return nil, err
+		}
+		if register != nil {
+			register(msg.TransactionID)
 		}
 		if _, err := conn.WriteTo(msg.Raw, addr); err != nil {
 			continue

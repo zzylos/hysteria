@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -165,6 +166,37 @@ func TestClientEvents(t *testing.T) {
 	assert.Equal(t, []string{"198.51.100.20:4433"}, ev.Addresses)
 	assert.Equal(t, "00112233445566778899aabbccddeeff", ev.Nonce)
 	assert.Equal(t, "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff", ev.Obfs)
+}
+
+func TestClientEventsRecordsHeartbeatAcks(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, "event: heartbeat_ack\ndata: {\"ttl\":60}\n\n")
+		_, _ = fmt.Fprint(w, "event: punch\ndata: {\"addresses\":[\"198.51.100.20:4433\"],\"nonce\":\"00112233445566778899aabbccddeeff\",\"obfs\":\"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"}\n\n")
+	}))
+	defer ts.Close()
+
+	c := newTestClient(t, ts.URL, "realm-token")
+	events, err := c.Events(context.Background(), "realm", "session-token")
+	require.NoError(t, err)
+	defer events.Close()
+	assert.True(t, events.LastHeartbeatAck().IsZero())
+
+	before := time.Now()
+	ev, err := events.Next()
+	require.NoError(t, err)
+	assert.Equal(t, []string{"198.51.100.20:4433"}, ev.Addresses)
+	assert.False(t, events.LastHeartbeatAck().Before(before))
+}
+
+func TestNewClientUsesHealthCheckedTransport(t *testing.T) {
+	c := newTestClient(t, "https://example.com", "realm-token")
+	tr, ok := c.httpClient.Transport.(*http.Transport)
+	require.True(t, ok)
+	require.NotNil(t, tr.HTTP2)
+	assert.Equal(t, http2PingTimeout, tr.HTTP2.SendPingTimeout)
+	assert.Equal(t, responseHeaderTimeout, tr.ResponseHeaderTimeout)
 }
 
 func TestNewPunchMetadata(t *testing.T) {

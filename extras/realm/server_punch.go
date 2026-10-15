@@ -43,7 +43,8 @@ func (p *ServerPuncher) Respond(ctx context.Context, attemptID string, localAddr
 	if attemptID == "" {
 		return PunchResult{}, fmt.Errorf("%w: id is required", ErrInvalidPunchAttempt)
 	}
-	if _, _, err := decodePunchMetadata(meta); err != nil {
+	key, err := newPunchKey(meta)
+	if err != nil {
 		return PunchResult{}, err
 	}
 	candidates := candidatePunchAddrs(localAddrs, peerAddrs, effectiveFamily(config.Family, p.conn.LocalAddr()))
@@ -76,7 +77,7 @@ func (p *ServerPuncher) Respond(ctx context.Context, attemptID string, localAddr
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	sendPunchPackets(p.conn, candidates, meta, PunchPacketHello)
+	sendPunchPackets(p.conn, candidates, &key, PunchPacketHello)
 
 	for {
 		select {
@@ -86,10 +87,10 @@ func (p *ServerPuncher) Respond(ctx context.Context, attemptID string, localAddr
 			}
 			return PunchResult{}, ctx.Err()
 		case <-ticker.C:
-			sendPunchPackets(p.conn, candidates, meta, PunchPacketHello)
+			sendPunchPackets(p.conn, candidates, &key, PunchPacketHello)
 		case ev := <-events:
 			if ev.Packet.Type == PunchPacketHello {
-				sendPunchPacket(p.conn, ev.From, meta, PunchPacketAck)
+				sendPunchPacket(p.conn, ev.From, &key, PunchPacketAck)
 			}
 			return PunchResult{
 				PeerAddr: ev.From,

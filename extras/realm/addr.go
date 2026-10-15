@@ -60,7 +60,7 @@ func ParseAddr(s string) (*Addr, error) {
 	if err != nil || token == "" {
 		return nil, fmt.Errorf("%w: realm token is required", ErrInvalidAddr)
 	}
-	if u.RawQuery != "" && u.ForceQuery {
+	if u.RawQuery == "" && u.ForceQuery {
 		return nil, fmt.Errorf("%w: empty query marker is not supported", ErrInvalidAddr)
 	}
 	if u.Fragment != "" || u.RawFragment != "" {

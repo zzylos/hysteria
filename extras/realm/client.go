@@ -13,9 +13,46 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"time"
 )
 
 const maxErrorBodySize = 64 * 1024
+
+const (
+	// responseHeaderTimeout bounds how long a request waits for response
+	// headers. The server holds connect requests for up to about 10
+	// seconds, so this has to stay well above that.
+	responseHeaderTimeout = 30 * time.Second
+	// http2PingTimeout is how long an HTTP/2 connection may stay silent
+	// before it is pinged, and how long the ping may go unanswered before
+	// the connection is closed.
+	http2PingTimeout = 15 * time.Second
+)
+
+// NewHTTPTransport returns an HTTP transport for talking to a rendezvous
+// server. Unlike http.DefaultTransport, it notices dead HTTP/2 connections,
+// which would otherwise stall the event stream and every request sharing
+// the connection until the OS gives up on it, and it bounds how long a
+// request waits for response headers.
+func NewHTTPTransport() *http.Transport {
+	var tr *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		tr = base.Clone()
+	} else {
+		tr = &http.Transport{Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: true}
+	}
+	tr.ResponseHeaderTimeout = responseHeaderTimeout
+	tr.HTTP2 = &http.HTTP2Config{
+		SendPingTimeout: http2PingTimeout,
+		PingTimeout:     http2PingTimeout,
+	}
+	return tr
+}
+
+var defaultHTTPClient = sync.OnceValue(func() *http.Client {
+	return &http.Client{Transport: NewHTTPTransport()}
+})
 
 const (
 	PunchNonceSize   = 16
@@ -112,7 +149,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 	}
 	httpClient := config.HTTPClient
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = defaultHTTPClient()
 	}
 	baseURL := *config.BaseURL
 	baseURL.RawQuery = ""
@@ -276,6 +313,9 @@ func decodeStatusError(resp *http.Response) error {
 type EventStream struct {
 	resp    *http.Response
 	scanner *bufio.Scanner
+
+	mu      sync.Mutex
+	lastAck time.Time
 }
 
 func newEventStream(resp *http.Response) *EventStream {
@@ -291,6 +331,19 @@ func (s *EventStream) Close() error {
 	return s.resp.Body.Close()
 }
 
+// LastHeartbeatAck returns when the stream last delivered a heartbeat_ack
+// event, or the zero time if it hasn't delivered one. The server sends one
+// after every successful heartbeat, so a stream that stops delivering them
+// is probably dead even if its connection still looks open. It is safe to
+// call while another goroutine is blocked in Next.
+func (s *EventStream) LastHeartbeatAck() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastAck
+}
+
+// Next returns the next punch event. Other events are consumed without
+// being returned; heartbeat_ack events update LastHeartbeatAck.
 func (s *EventStream) Next() (*PunchEvent, error) {
 	var eventName string
 	var data strings.Builder
@@ -299,6 +352,11 @@ func (s *EventStream) Next() (*PunchEvent, error) {
 		if line == "" {
 			if eventName == "" && data.Len() == 0 {
 				continue
+			}
+			if eventName == "heartbeat_ack" {
+				s.mu.Lock()
+				s.lastAck = time.Now()
+				s.mu.Unlock()
 			}
 			if eventName != "punch" {
 				eventName = ""

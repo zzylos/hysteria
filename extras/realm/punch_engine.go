@@ -42,7 +42,8 @@ func Punch(ctx context.Context, conn net.PacketConn, localAddrs, peerAddrs []net
 	if conn == nil {
 		return PunchResult{}, fmt.Errorf("%w: conn is nil", ErrInvalidPunchConfig)
 	}
-	if _, _, err := decodePunchMetadata(meta); err != nil {
+	key, err := newPunchKey(meta)
+	if err != nil {
 		return PunchResult{}, err
 	}
 	candidates := candidatePunchAddrs(localAddrs, peerAddrs, effectiveFamily(config.Family, conn.LocalAddr()))
@@ -79,7 +80,7 @@ func Punch(ctx context.Context, conn net.PacketConn, localAddrs, peerAddrs []net
 		}
 		now := time.Now()
 		if !now.Before(nextSend) {
-			sendPunchPackets(conn, candidates, meta, PunchPacketHello)
+			sendPunchPackets(conn, candidates, &key, PunchPacketHello)
 			nextSend = now.Add(interval)
 		}
 
@@ -99,12 +100,12 @@ func Punch(ctx context.Context, conn net.PacketConn, localAddrs, peerAddrs []net
 		if !ok {
 			continue
 		}
-		packet, err := DecodePunchPacket(buf[:n], meta)
+		packet, err := key.decode(buf[:n])
 		if err != nil {
 			continue
 		}
 		if packet.Type == PunchPacketHello {
-			sendPunchPacket(conn, peerAddr, meta, PunchPacketAck)
+			sendPunchPacket(conn, peerAddr, &key, PunchPacketAck)
 		}
 		return PunchResult{
 			PeerAddr: peerAddr,
@@ -113,14 +114,14 @@ func Punch(ctx context.Context, conn net.PacketConn, localAddrs, peerAddrs []net
 	}
 }
 
-func sendPunchPackets(conn net.PacketConn, addrs []netip.AddrPort, meta PunchMetadata, packetType PunchPacketType) {
+func sendPunchPackets(conn net.PacketConn, addrs []netip.AddrPort, key *punchKey, packetType PunchPacketType) {
 	for _, addr := range addrs {
-		sendPunchPacket(conn, addr, meta, packetType)
+		sendPunchPacket(conn, addr, key, packetType)
 	}
 }
 
-func sendPunchPacket(conn net.PacketConn, addr netip.AddrPort, meta PunchMetadata, packetType PunchPacketType) {
-	packet, err := EncodePunchPacket(packetType, meta)
+func sendPunchPacket(conn net.PacketConn, addr netip.AddrPort, key *punchKey, packetType PunchPacketType) {
+	packet, err := key.encode(packetType)
 	if err != nil {
 		return
 	}
@@ -129,10 +130,16 @@ func sendPunchPacket(conn net.PacketConn, addr netip.AddrPort, meta PunchMetadat
 
 func candidatePunchAddrs(localAddrs, peerAddrs []netip.AddrPort, family AddrFamily) []netip.AddrPort {
 	allowedFamilies := punchFamilies(localAddrs, family)
+	// Loopback peers only make sense when this side is on loopback too,
+	// that is, when both ends run on one machine.
+	allowLoopback := slices.ContainsFunc(localAddrs, func(a netip.AddrPort) bool {
+		return a.Addr().Unmap().IsLoopback()
+	})
 	seen := make(map[netip.AddrPort]struct{})
 	var candidates []netip.AddrPort
 	for _, addr := range peerAddrs {
-		if !addr.IsValid() || addr.Port() == 0 {
+		addr = netip.AddrPortFrom(addr.Addr().Unmap(), addr.Port())
+		if !usablePunchAddr(addr, allowLoopback) {
 			continue
 		}
 		if !allowedFamilies.allows(addr.Addr()) {
@@ -252,6 +259,28 @@ func (s punchFamilySet) allows(addr netip.Addr) bool {
 		return s.v6
 	}
 	return false
+}
+
+var ipv4Broadcast = netip.AddrFrom4([4]byte{255, 255, 255, 255})
+
+// usablePunchAddr reports whether addr can belong to a remote peer. Port 0,
+// unspecified, link-local, multicast and broadcast addresses never do. Peer
+// addresses come from the rendezvous server, and on the server side from
+// whoever holds the realm token, so accepting them would let others aim
+// punch traffic at this host's neighbors or at multicast groups. Loopback
+// is allowed only when allowLoopback is set.
+func usablePunchAddr(addr netip.AddrPort, allowLoopback bool) bool {
+	if !addr.IsValid() || addr.Port() == 0 || addr.Addr().Zone() != "" {
+		return false
+	}
+	ip := addr.Addr().Unmap()
+	if ip.IsLoopback() {
+		return allowLoopback
+	}
+	return !ip.IsUnspecified() &&
+		!ip.IsLinkLocalUnicast() &&
+		!ip.IsMulticast() &&
+		ip != ipv4Broadcast
 }
 
 func addrToAddrPort(addr net.Addr) (netip.AddrPort, bool) {

@@ -180,6 +180,44 @@ func TestCandidatePunchAddrsExpansionHandlesPortBounds(t *testing.T) {
 	}, candidates)
 }
 
+func TestCandidatePunchAddrsSkipsUnusableAddresses(t *testing.T) {
+	local := []netip.AddrPort{netip.MustParseAddrPort("192.0.2.10:1234")}
+	peer := []netip.AddrPort{
+		netip.MustParseAddrPort("127.0.0.1:4433"),
+		netip.MustParseAddrPort("0.0.0.0:4433"),
+		netip.MustParseAddrPort("224.0.0.251:5353"),
+		netip.MustParseAddrPort("255.255.255.255:4433"),
+		netip.MustParseAddrPort("169.254.10.20:4433"),
+		netip.MustParseAddrPort("198.51.100.20:0"),
+		netip.MustParseAddrPort("[::ffff:198.51.100.30]:4433"),
+		netip.MustParseAddrPort("198.51.100.20:4433"),
+	}
+	assert.Equal(t, []netip.AddrPort{
+		netip.MustParseAddrPort("198.51.100.20:4433"),
+		netip.MustParseAddrPort("198.51.100.30:4433"),
+	}, candidatePunchAddrs(local, peer, AddrFamilyAny))
+
+	local6 := []netip.AddrPort{netip.MustParseAddrPort("[2001:db8::10]:1234")}
+	peer6 := []netip.AddrPort{
+		netip.MustParseAddrPort("[::1]:4433"),
+		netip.MustParseAddrPort("[::]:4433"),
+		netip.MustParseAddrPort("[fe80::1]:4433"),
+		netip.MustParseAddrPort("[fe80::1%eth0]:4433"),
+		netip.MustParseAddrPort("[ff02::1]:4433"),
+		netip.MustParseAddrPort("[2001:db8::20]:4433"),
+	}
+	assert.Equal(t, []netip.AddrPort{
+		netip.MustParseAddrPort("[2001:db8::20]:4433"),
+	}, candidatePunchAddrs(local6, peer6, AddrFamilyAny))
+}
+
+func TestCandidatePunchAddrsAllowsLoopbackOnlyFromLoopback(t *testing.T) {
+	peer := []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:4433")}
+	assert.Equal(t, peer, candidatePunchAddrs([]netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:1234")}, peer, AddrFamilyAny))
+	assert.Empty(t, candidatePunchAddrs([]netip.AddrPort{netip.MustParseAddrPort("192.0.2.10:1234")}, peer, AddrFamilyAny))
+	assert.Empty(t, candidatePunchAddrs(nil, peer, AddrFamilyAny))
+}
+
 func TestPunchTimeout(t *testing.T) {
 	meta := testPunchMetadata()
 	client := listenUDP4(t)

@@ -38,9 +38,12 @@ type PunchPacketConn struct {
 	udp *net.UDPConn
 
 	mu       sync.RWMutex
-	attempts map[string]PunchMetadata
-	events   chan PunchPacketEvent
-	stun     chan STUNPacketEvent
+	attempts map[string]punchKey
+	// stunWaiters routes STUN responses by transaction ID to the discovery
+	// that sent the request. Other responses go to stun.
+	stunWaiters map[[stun.TransactionIDSize]byte]chan<- STUNPacketEvent
+	events      chan PunchPacketEvent
+	stun        chan STUNPacketEvent
 }
 
 func NewPunchPacketConn(conn net.PacketConn, eventBuffer int) (*PunchPacketConn, error) {
@@ -52,11 +55,12 @@ func NewPunchPacketConn(conn net.PacketConn, eventBuffer int) (*PunchPacketConn,
 	}
 	udp, _ := conn.(*net.UDPConn)
 	return &PunchPacketConn{
-		PacketConn: conn,
-		udp:        udp,
-		attempts:   make(map[string]PunchMetadata),
-		events:     make(chan PunchPacketEvent, eventBuffer),
-		stun:       make(chan STUNPacketEvent, eventBuffer),
+		PacketConn:  conn,
+		udp:         udp,
+		attempts:    make(map[string]punchKey),
+		stunWaiters: make(map[[stun.TransactionIDSize]byte]chan<- STUNPacketEvent),
+		events:      make(chan PunchPacketEvent, eventBuffer),
+		stun:        make(chan STUNPacketEvent, eventBuffer),
 	}, nil
 }
 
@@ -99,11 +103,12 @@ func (c *PunchPacketConn) AddPunchAttempt(id string, meta PunchMetadata) error {
 	if id == "" {
 		return fmt.Errorf("%w: id is required", ErrInvalidPunchAttempt)
 	}
-	if _, _, err := decodePunchMetadata(meta); err != nil {
+	key, err := newPunchKey(meta)
+	if err != nil {
 		return err
 	}
 	c.mu.Lock()
-	c.attempts[id] = meta
+	c.attempts[id] = key
 	c.mu.Unlock()
 	return nil
 }
@@ -143,17 +148,22 @@ func (c *PunchPacketConn) decodeSTUNPacket(packet []byte) (STUNPacketEvent, bool
 	return STUNPacketEvent{Message: msg, Addr: addr}, true
 }
 
+// decodePunchPacket runs for every packet QUIC reads while punch attempts
+// are active, so it avoids allocating for packets that don't match.
 func (c *PunchPacketConn) decodePunchPacket(packet []byte, from net.Addr) (PunchPacketEvent, bool) {
-	fromAddr, ok := addrToAddrPort(from)
-	if !ok {
+	if checkPunchPacketLen(packet) != nil {
 		return PunchPacketEvent{}, false
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	for id, meta := range c.attempts {
-		punchPacket, err := DecodePunchPacket(packet, meta)
+	for id, key := range c.attempts {
+		punchPacket, err := key.decode(packet)
 		if err != nil {
 			continue
+		}
+		fromAddr, ok := addrToAddrPort(from)
+		if !ok {
+			return PunchPacketEvent{}, false
 		}
 		return PunchPacketEvent{
 			AttemptID: id,
@@ -172,8 +182,34 @@ func (c *PunchPacketConn) emitPunch(ev PunchPacketEvent) {
 }
 
 func (c *PunchPacketConn) emitSTUN(ev STUNPacketEvent) {
+	c.mu.RLock()
+	ch, ok := c.stunWaiters[ev.Message.TransactionID]
+	c.mu.RUnlock()
+	if !ok {
+		ch = c.stun
+	}
 	select {
-	case c.stun <- ev:
+	case ch <- ev:
 	default:
 	}
+}
+
+// expectSTUN sends the response to STUN transaction id to ch instead of
+// STUNEvents, so concurrent discoveries on one conn can't consume each
+// other's responses.
+func (c *PunchPacketConn) expectSTUN(id [stun.TransactionIDSize]byte, ch chan<- STUNPacketEvent) {
+	c.mu.Lock()
+	if c.stunWaiters == nil {
+		c.stunWaiters = make(map[[stun.TransactionIDSize]byte]chan<- STUNPacketEvent)
+	}
+	c.stunWaiters[id] = ch
+	c.mu.Unlock()
+}
+
+func (c *PunchPacketConn) forgetSTUN(ids [][stun.TransactionIDSize]byte) {
+	c.mu.Lock()
+	for _, id := range ids {
+		delete(c.stunWaiters, id)
+	}
+	c.mu.Unlock()
 }

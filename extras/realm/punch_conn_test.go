@@ -3,6 +3,7 @@ package realm
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"syscall"
@@ -13,6 +14,46 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// Every packet QUIC reads is checked against the active punch attempts, so
+// rejecting one has to stay cheap.
+func TestPunchPacketConnRejectsNonPunchPacketWithoutAllocating(t *testing.T) {
+	c := punchConnWithAttempts(t, 4)
+	packet := make([]byte, 600)
+	from := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 4433}
+	allocs := testing.AllocsPerRun(100, func() {
+		if _, ok := c.decodePunchPacket(packet, from); ok {
+			t.Fatal("matched a packet that is not a punch packet")
+		}
+	})
+	assert.Zero(t, allocs)
+}
+
+func BenchmarkPunchPacketConnNonPunchPacket(b *testing.B) {
+	for _, n := range []int{1, 16} {
+		b.Run(fmt.Sprintf("%d-attempts", n), func(b *testing.B) {
+			c := punchConnWithAttempts(b, n)
+			packet := make([]byte, 600)
+			from := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 4433}
+			b.ReportAllocs()
+			for b.Loop() {
+				c.decodePunchPacket(packet, from)
+			}
+		})
+	}
+}
+
+func punchConnWithAttempts(tb testing.TB, n int) *PunchPacketConn {
+	tb.Helper()
+	c, err := NewPunchPacketConn(nonUDPPacketConn{}, 0)
+	require.NoError(tb, err)
+	for range n {
+		meta, err := NewPunchMetadata()
+		require.NoError(tb, err)
+		require.NoError(tb, c.AddPunchAttempt(meta.Nonce, meta))
+	}
+	return c
+}
 
 func TestPunchPacketConnPassesThroughNonPunchPackets(t *testing.T) {
 	server := listenUDP4(t)

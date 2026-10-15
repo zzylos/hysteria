@@ -491,6 +491,7 @@ func (c *serverConfig) startRealmServerRuntime(ctx context.Context, cancel conte
 		punchConn:   punchConn,
 		stunServers: stunServers,
 		puncher:     puncher,
+		punchSem:    make(chan struct{}, realmMaxConcurrentPunches),
 		config:      c.Realm,
 		family:      family,
 	}
@@ -514,7 +515,7 @@ func (c *serverConfig) startRealmServerRuntime(ctx context.Context, cancel conte
 		cleanupMapper()
 		return nil, configError{Field: "realm.stun", Err: err}
 	}
-	initialSession, err := rt.register(ctx)
+	initialSession, err := rt.registerAtStartup(ctx)
 	if err != nil {
 		cleanupMapper()
 		return nil, configError{Field: "realm.register", Err: err}
@@ -541,12 +542,26 @@ func (c *serverConfig) realmHTTPClient() *http.Client {
 	if !c.Realm.Insecure {
 		return nil
 	}
-	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr := realm.NewHTTPTransport()
 	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	return &http.Client{Transport: tr}
 }
 
-const realmConnectSTUNCacheTTL = 10 * time.Second
+const (
+	realmConnectSTUNCacheTTL = 10 * time.Second
+	// realmRequestTimeout bounds register and heartbeat requests, which
+	// would otherwise wait on a dead connection until the OS gives up.
+	realmRequestTimeout = 10 * time.Second
+	// realmStartupRegisterWait is how long startup keeps retrying a
+	// registration that can still succeed, for example while the realm
+	// name is held by the session of an earlier run that didn't shut down
+	// cleanly. It covers the rendezvous server's default 60s session TTL.
+	realmStartupRegisterWait = 90 * time.Second
+	// realmMaxConcurrentPunches caps punch attempts running at once. Each
+	// one sends packets for up to the punch timeout, and anyone with the
+	// realm token can start them.
+	realmMaxConcurrentPunches = 16
+)
 
 type realmServerRuntime struct {
 	cancel      context.CancelFunc
@@ -555,6 +570,7 @@ type realmServerRuntime struct {
 	punchConn   *realm.PunchPacketConn
 	stunServers []string
 	puncher     *realm.ServerPuncher
+	punchSem    chan struct{}
 	config      serverConfigRealm
 	family      realm.AddrFamily
 	mapper      *realm.PortMapper // nil if port mapping is disabled or failed
@@ -616,13 +632,47 @@ func (r *realmServerRuntime) registerWithBackoff(ctx context.Context) realmSessi
 	return realmSession{}
 }
 
+// registerAtStartup registers the realm, retrying for a while on errors
+// that can clear up on their own. The usual one is 409 realm_taken after a
+// crash or kill -9: the previous run never deregistered, so its session
+// keeps the name until the rendezvous server expires it.
+func (r *realmServerRuntime) registerAtStartup(ctx context.Context) (realmSession, error) {
+	deadline := time.Now().Add(realmStartupRegisterWait)
+	backoff := time.Second
+	for {
+		sess, err := r.register(ctx)
+		if err == nil {
+			return sess, nil
+		}
+		if isRealmRegisterFatal(err) || isRealmUnauthorized(err) || time.Now().Add(backoff).After(deadline) {
+			return realmSession{}, err
+		}
+		if isRealmTaken(err) {
+			logger.Warn("realm name is still registered, probably by an earlier run that did not shut down cleanly; retrying until that session expires",
+				zap.String("realm", r.realmID),
+				zap.String("backoff", formatLogDuration(backoff)))
+		} else {
+			logger.Warn("realm registration failed; retrying",
+				zap.String("realm", r.realmID),
+				zap.Error(err),
+				zap.String("backoff", formatLogDuration(backoff)))
+		}
+		if !sleepContext(ctx, backoff) {
+			return realmSession{}, err
+		}
+		backoff = min(2*backoff, 10*time.Second)
+	}
+}
+
 func (r *realmServerRuntime) register(ctx context.Context) (realmSession, error) {
 	localAddrs := r.currentAddrs()
 	logger.Debug("realm registration started",
 		zap.String("realm", r.realmID),
 		zap.Strings("addresses", addrPortStrings(localAddrs)))
 	start := time.Now()
-	registerResp, err := r.client.Register(ctx, r.realmID, addrPortStrings(localAddrs))
+	reqCtx, cancel := context.WithTimeout(ctx, realmRequestTimeout)
+	registerResp, err := r.client.Register(reqCtx, r.realmID, addrPortStrings(localAddrs))
+	cancel()
 	if err != nil {
 		return realmSession{}, err
 	}
@@ -650,57 +700,123 @@ func (r *realmServerRuntime) runSession(ctx context.Context, sess realmSession) 
 }
 
 func (r *realmServerRuntime) heartbeatLoop(ctx context.Context, sess realmSession) error {
-	interval := r.config.HeartbeatInterval
-	if interval == 0 {
-		interval = sessionTTLDuration(sess.ttl) / 2
-		if interval <= 0 {
-			interval = 15 * time.Second
-		}
-	}
-	t := time.NewTicker(interval)
-	defer t.Stop()
+	interval := r.heartbeatInterval(sess.ttl)
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 	lastOK := time.Now()
 	lastPublished := r.currentAddrs()
+	failures := 0
 	for {
 		select {
 		case <-ctx.Done():
 			logger.Debug("realm heartbeat loop stopped", zap.String("realm", r.realmID))
 			return ctx.Err()
-		case <-t.C:
-			logger.Debug("realm heartbeat started", zap.String("realm", r.realmID))
-			start := time.Now()
-			req := realm.HeartbeatRequest{}
-			if current := r.currentAddrs(); !slices.Equal(current, lastPublished) {
-				req.Addresses = addrPortStrings(current)
-				lastPublished = current
-				logger.Debug("realm addresses changed", zap.String("realm", r.realmID), zap.Strings("addresses", req.Addresses))
+		case <-timer.C:
+		}
+		logger.Debug("realm heartbeat started", zap.String("realm", r.realmID))
+		start := time.Now()
+		req := realm.HeartbeatRequest{}
+		current := r.currentAddrs()
+		if !slices.Equal(current, lastPublished) {
+			req.Addresses = addrPortStrings(current)
+			logger.Debug("realm addresses changed", zap.String("realm", r.realmID), zap.Strings("addresses", req.Addresses))
+		}
+		reqCtx, cancel := context.WithTimeout(ctx, realmRequestTimeout)
+		resp, err := r.client.Heartbeat(reqCtx, r.realmID, sess.id, req)
+		cancel()
+		if err != nil {
+			if isRealmSessionInvalid(err) {
+				return errRealmSessionInvalid
 			}
-			resp, err := r.client.Heartbeat(ctx, r.realmID, sess.id, req)
-			if err != nil {
-				if isRealmSessionInvalid(err) {
-					return errRealmSessionInvalid
-				}
-				logger.Warn("realm heartbeat failed", zap.String("realm", r.realmID), zap.Error(err))
-				if time.Since(lastOK) > sessionTTLDuration(sess.ttl) {
-					return errRealmSessionLost
-				}
-				continue
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
-			lastOK = time.Now()
-			logger.Debug("realm heartbeat completed",
-				zap.String("realm", r.realmID),
-				zap.Int("ttl", resp.TTL),
-				zap.Bool("addressesUpdated", len(req.Addresses) > 0),
-				zap.String("duration", formatLogDuration(time.Since(start))))
-			if r.config.HeartbeatInterval == 0 && resp.TTL > 0 {
-				next := time.Duration(resp.TTL) * time.Second / 2
-				if next > 0 && next != interval {
-					interval = next
-					t.Reset(interval)
+			logger.Warn("realm heartbeat failed", zap.String("realm", r.realmID), zap.Error(err))
+			if time.Since(lastOK) > sessionTTLDuration(sess.ttl) {
+				return errRealmSessionLost
+			}
+			// Retry soon. Waiting a full interval would let the session
+			// expire on the server before the next attempt.
+			failures++
+			timer.Reset(realmHeartbeatRetryDelay(failures, interval))
+			continue
+		}
+		failures = 0
+		lastOK = time.Now()
+		// Only now does the server have these addresses. If the request
+		// had failed, the next heartbeat would send them again.
+		lastPublished = current
+		logger.Debug("realm heartbeat completed",
+			zap.String("realm", r.realmID),
+			zap.Int("ttl", resp.TTL),
+			zap.Bool("addressesUpdated", len(req.Addresses) > 0),
+			zap.String("duration", formatLogDuration(time.Since(start))))
+		if resp.TTL > 0 {
+			interval = r.heartbeatInterval(resp.TTL)
+		}
+		timer.Reset(interval)
+	}
+}
+
+// heartbeatInterval is the configured interval, or a third of the session
+// TTL. That leaves room for a failed heartbeat to be retried before the
+// session expires.
+func (r *realmServerRuntime) heartbeatInterval(ttl int) time.Duration {
+	if r.config.HeartbeatInterval > 0 {
+		return r.config.HeartbeatInterval
+	}
+	return sessionTTLDuration(ttl) / 3
+}
+
+// realmHeartbeatRetryDelay is the wait before retrying after the given
+// number of consecutive failed heartbeats: 2s, 4s, 8s and so on, but never
+// longer than the regular interval.
+func realmHeartbeatRetryDelay(failures int, interval time.Duration) time.Duration {
+	d := 2 * time.Second
+	for i := 1; i < failures && d < interval; i++ {
+		d *= 2
+	}
+	return min(d, interval)
+}
+
+// eventStreamStaleAfter is how long the events stream may go without a
+// heartbeat_ack before it is treated as dead. An ack follows each
+// successful heartbeat. Reconnecting a healthy stream by mistake is cheap,
+// since the server keeps queued events for the new stream, so this doesn't
+// wait for more than one missing ack.
+func (r *realmServerRuntime) eventStreamStaleAfter(ttl int) time.Duration {
+	return r.heartbeatInterval(ttl) + 10*time.Second
+}
+
+// watchEventStream closes stream when the rendezvous server stops sending
+// heartbeat acks on it, which happens when the connection died without
+// either side noticing. Next then fails and eventsLoop reconnects. Servers
+// that don't send acks at all are left alone. The returned func stops the
+// watch.
+func (r *realmServerRuntime) watchEventStream(ctx context.Context, stream *realm.EventStream, staleAfter time.Duration) func() {
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(staleAfter / 6)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-t.C:
+				last := stream.LastHeartbeatAck()
+				if !last.IsZero() && time.Since(last) > staleAfter {
+					logger.Warn("realm events stream stopped receiving heartbeat acks; reconnecting",
+						zap.String("realm", r.realmID),
+						zap.String("sinceLastAck", formatLogDuration(time.Since(last))))
+					_ = stream.Close()
+					return
 				}
 			}
 		}
-	}
+	}()
+	return func() { close(done) }
 }
 
 func (r *realmServerRuntime) eventsLoop(ctx context.Context, sess realmSession) error {
@@ -735,6 +851,7 @@ func (r *realmServerRuntime) eventsLoop(ctx context.Context, sess realmSession) 
 		lastOK = time.Now()
 		logger.Debug("realm events stream connected", zap.String("realm", r.realmID))
 		backoff = time.Second
+		stopWatch := r.watchEventStream(ctx, stream, r.eventStreamStaleAfter(sess.ttl))
 		for {
 			ev, err := stream.Next()
 			if err != nil {
@@ -749,9 +866,28 @@ func (r *realmServerRuntime) eventsLoop(ctx context.Context, sess realmSession) 
 				zap.String("realm", r.realmID),
 				zap.String("attempt", shortAttempt(ev.Nonce)),
 				zap.Strings("addresses", ev.Addresses))
-			go r.respond(ctx, ev)
+			r.startRespond(ctx, ev)
 		}
+		stopWatch()
 	}
+}
+
+// startRespond answers a punch event in the background, unless too many
+// punch attempts are already running.
+func (r *realmServerRuntime) startRespond(ctx context.Context, ev *realm.PunchEvent) {
+	select {
+	case r.punchSem <- struct{}{}:
+	default:
+		logger.Warn("realm punch event dropped: too many punch attempts in progress",
+			zap.String("realm", r.realmID),
+			zap.String("attempt", shortAttempt(ev.Nonce)),
+			zap.Int("limit", cap(r.punchSem)))
+		return
+	}
+	go func() {
+		defer func() { <-r.punchSem }()
+		r.respond(ctx, ev)
+	}()
 }
 
 func (r *realmServerRuntime) connectAddrs(ctx context.Context) ([]netip.AddrPort, error) {
@@ -936,6 +1072,16 @@ func isRealmSessionInvalid(err error) bool {
 func isRealmRegisterFatal(err error) bool {
 	var statusErr *realm.StatusError
 	return errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusBadRequest
+}
+
+func isRealmUnauthorized(err error) bool {
+	var statusErr *realm.StatusError
+	return errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusUnauthorized
+}
+
+func isRealmTaken(err error) bool {
+	var statusErr *realm.StatusError
+	return errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusConflict
 }
 
 func sleepContext(ctx context.Context, d time.Duration) bool {

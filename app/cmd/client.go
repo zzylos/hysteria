@@ -51,6 +51,16 @@ var defaultRealmSTUNServers = []string{
 	"global.stun.twilio.com:3478",
 }
 
+// realmConnectTimeout bounds the connect request to the rendezvous server.
+// The server holds it for up to about 10 seconds while the realm server
+// answers. Without a limit, an unresponsive rendezvous server would block
+// the client forever, along with every request waiting to reconnect.
+const realmConnectTimeout = 20 * time.Second
+
+// The realm config is rebuilt on every reconnect; warn about the server
+// name only once.
+var realmServerNameWarning sync.Once
+
 // Client flags
 var (
 	showQR bool
@@ -678,6 +688,15 @@ func (c *clientConfig) realmConfig(addr *realm.Addr) (*client.Config, error) {
 	}
 	if c.TLS.SNI == "" {
 		hyConfig.TLSConfig.ServerName = addr.Host
+		if !c.TLS.Insecure && c.TLS.PinSHA256 == "" && c.TLS.CA == "" {
+			realmServerNameWarning.Do(func() {
+				logger.Warn("realm: the server certificate is checked against the rendezvous host name, "+
+					"so whoever runs the rendezvous server could pass as your realm server; "+
+					"set tls.pinSHA256, tls.ca or tls.sni to check the realm server's own certificate",
+					zap.String("realm", addr.RealmID),
+					zap.String("rendezvous", addr.Host))
+			})
+		}
 	}
 	family, network, err := realmIPMode(c.Realm.IPMode)
 	if err != nil {
@@ -756,10 +775,12 @@ func (c *clientConfig) realmConfig(addr *realm.Addr) (*client.Config, error) {
 		zap.String("attempt", attempt),
 		zap.Strings("addresses", addrPortStrings(localAddrs)))
 	connectStart := time.Now()
-	connectResp, err := rClient.Connect(ctx, addr.RealmID, realm.ConnectRequest{
+	connectCtx, cancelConnect := context.WithTimeout(ctx, realmConnectTimeout)
+	connectResp, err := rClient.Connect(connectCtx, addr.RealmID, realm.ConnectRequest{
 		Addresses:     addrPortStrings(localAddrs),
 		PunchMetadata: meta,
 	})
+	cancelConnect()
 	if err != nil {
 		return nil, configError{Field: "realm.connect", Err: err}
 	}
@@ -777,7 +798,9 @@ func (c *clientConfig) realmConfig(addr *realm.Addr) (*client.Config, error) {
 		zap.String("attempt", attempt),
 		zap.Strings("candidates", connectResp.Addresses))
 	punchStart := time.Now()
-	result, err := realm.Punch(ctx, baseConn, localAddrs, peerAddrs, connectResp.PunchMetadata, realm.PunchConfig{
+	// Punch with the metadata generated here, not the copy the rendezvous
+	// server echoed back.
+	result, err := realm.Punch(ctx, baseConn, localAddrs, peerAddrs, meta, realm.PunchConfig{
 		Timeout: c.Realm.PunchTimeout,
 		Family:  family,
 	})
@@ -825,7 +848,7 @@ func (c *clientConfig) realmHTTPClient() *stdHTTP.Client {
 	if !c.Realm.Insecure {
 		return nil
 	}
-	tr := stdHTTP.DefaultTransport.(*stdHTTP.Transport).Clone()
+	tr := realm.NewHTTPTransport()
 	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	return &stdHTTP.Client{Transport: tr}
 }
